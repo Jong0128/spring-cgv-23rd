@@ -113,6 +113,9 @@ public enum ErrorCode {
     // 취소 권한 없음 (타 유저 주문)
     INVALID_ORDER_OWNER(HttpStatus.FORBIDDEN, "ORD003", "해당 주문을 취소할 권한이 없습니다."),
 
+    // 주문 상태 불일치
+    INVALID_ORDER_STATUS(HttpStatus.BAD_REQUEST, "ORD004", "주문 상태가 올바르지 않습니다."),
+
     // 요청 매점 불일치
     INVALID_INVENTORY(HttpStatus.BAD_REQUEST, "INV001", "잘못된 매점 요청입니다."),
 

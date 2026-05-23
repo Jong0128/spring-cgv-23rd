@@ -16,10 +16,12 @@ import com.ceos23.cgv_clone.user.repository.UserRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Objects;
 
 import static java.time.LocalDate.*;
 import static java.time.format.DateTimeFormatter.*;
@@ -34,10 +36,27 @@ public class OrderServicePessimistic implements OrderService {
     private final InventoryRepository inventoryRepository;
     private final OrderRepository orderRepository;
     private final PaymentService paymentService;
+    private final TransactionTemplate transactionTemplate;
 
     @Override
-    @Transactional
     public OrderResponse createOrder(Long userId, Long storeId, OrderRequest request) {
+        PendingOrder pendingOrder = Objects.requireNonNull(transactionTemplate.execute(status ->
+                createPendingOrder(userId, storeId, request)
+        ));
+
+        try {
+            paymentService.pay(pendingOrder.paymentId(), pendingOrder.orderName(), pendingOrder.totalPrice());
+        } catch (Exception e) {
+            transactionTemplate.executeWithoutResult(status -> cancelPendingOrder(pendingOrder.orderId()));
+            throw e;
+        }
+
+        return Objects.requireNonNull(transactionTemplate.execute(status ->
+                completePayment(pendingOrder.orderId())
+        ));
+    }
+
+    private PendingOrder createPendingOrder(Long userId, Long storeId, OrderRequest request) {
         User user = userRepository.findById(userId)
                 .orElseThrow(() -> new CustomException(ErrorCode.USER_NOT_FOUND));
         Store store = storeRepository.findById(storeId)
@@ -51,14 +70,29 @@ public class OrderServicePessimistic implements OrderService {
         String paymentId = generatePaymentId();
         String orderName = buildOrderName(inventories);
 
-        paymentService.pay(paymentId, orderName, totalPrice);
-
-        Order order = Order.createPaid(user, store, paymentId, totalPrice);
+        Order order = Order.createPending(user, store, paymentId, totalPrice);
 
         addOrderItems(order, inventories, items);
         orderRepository.save(order);
 
+        return new PendingOrder(order.getId(), paymentId, orderName, totalPrice);
+    }
+
+    private OrderResponse completePayment(Long orderId) {
+        Order order = orderRepository.findById(orderId)
+                .orElseThrow(() -> new CustomException(ErrorCode.ORDER_NOT_FOUND));
+
+        order.completePayment();
+
         return OrderResponse.from(order);
+    }
+
+    private void cancelPendingOrder(Long orderId) {
+        Order order = orderRepository.findById(orderId)
+                .orElseThrow(() -> new CustomException(ErrorCode.ORDER_NOT_FOUND));
+
+        restoreInventories(order);
+        order.cancelPending();
     }
 
     @Override
@@ -71,17 +105,7 @@ public class OrderServicePessimistic implements OrderService {
 
         paymentService.cancel(order.getPaymentId());
 
-        List<OrderItem> items = order.getOrderItems().stream()
-                .sorted(Comparator.comparing(oi -> oi.getInventory().getId()))
-                .toList();
-
-        for (OrderItem item : items) {
-            Inventory inv = inventoryRepository.findByIdWithPessimisticLock(item.getInventory().getId())
-                    .orElseThrow(() -> new CustomException(ErrorCode.ITEM_NOT_FOUND));
-
-            inv.increase(item.getQuantity());
-        }
-
+        restoreInventories(order);
         order.cancel();
 
         return OrderResponse.from(order);
@@ -109,6 +133,19 @@ public class OrderServicePessimistic implements OrderService {
     private void verifyOrderOwner(Long userId, Order order) {
         if(!order.getUser().getId().equals(userId)) {
             throw new CustomException(ErrorCode.INVALID_ORDER_OWNER);
+        }
+    }
+
+    private void restoreInventories(Order order) {
+        List<OrderItem> items = order.getOrderItems().stream()
+                .sorted(Comparator.comparing(oi -> oi.getInventory().getId()))
+                .toList();
+
+        for (OrderItem item : items) {
+            Inventory inv = inventoryRepository.findByIdWithPessimisticLock(item.getInventory().getId())
+                    .orElseThrow(() -> new CustomException(ErrorCode.ITEM_NOT_FOUND));
+
+            inv.increase(item.getQuantity());
         }
     }
 
@@ -151,6 +188,9 @@ public class OrderServicePessimistic implements OrderService {
     private String buildOrderName(List<Inventory> inventories) {
         String first = inventories.getFirst().getMenu().getName();
         return inventories.size() == 1 ? first : first + " 외 " + (inventories.size() - 1) + "건";
+    }
+
+    private record PendingOrder(Long orderId, String paymentId, String orderName, int totalPrice) {
     }
 
 }

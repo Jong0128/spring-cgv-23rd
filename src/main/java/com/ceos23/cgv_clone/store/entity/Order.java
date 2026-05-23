@@ -64,6 +64,32 @@ public class Order extends BaseEntity {
                 .build();
     }
 
+    public static Order createPending(User user, Store store, String paymentId, int totalPrice) {
+        return Order.builder()
+                .paymentId(paymentId)
+                .orderStatus(OrderStatus.PENDING)
+                .totalPrice(totalPrice)
+                .user(user)
+                .store(store)
+                .build();
+    }
+
+    public void completePayment() {
+        if (orderStatus != OrderStatus.PENDING) {
+            throw new CustomException(ErrorCode.INVALID_ORDER_STATUS);
+        }
+
+        this.orderStatus = OrderStatus.PAID;
+    }
+
+    public void cancelPending() {
+        if (orderStatus != OrderStatus.PENDING) {
+            throw new CustomException(ErrorCode.INVALID_ORDER_STATUS);
+        }
+
+        this.orderStatus = OrderStatus.CANCELED;
+    }
+
     public void cancel() {
         if (orderStatus != OrderStatus.PAID) {
             throw new CustomException(ErrorCode.ALREADY_CANCELED_ORDER);
