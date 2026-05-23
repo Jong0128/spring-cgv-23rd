@@ -1386,3 +1386,436 @@ Mac은 Apple Silicon 환경이라 기본적으로 `arm64` 이미지가 빌드될
 결제 API 실패 시 stack trace는 `application.log`에만 남기고, `audit.log`에는 요약 이벤트만 남기도록 분리했다.
 
 </details>
+
+<details>
+<summary> <h2> 성능 최적화 </h2> </summary>
+
+## 1. 최적화 진행 배경
+
+예매, 상영 시간표 조회, 만료 예약 처리 로직은 데이터가 누적될수록 조회 대상 row가 빠르게 늘어날 수 있다.
+
+따라서 DataGrip에서 `EXPLAIN ANALYZE`를 사용해 실제 실행 계획을 확인하고, 단일 컬럼 FK 인덱스만으로 충분하지 않은 쿼리에 복합 인덱스를 추가했다.
+
+테스트 데이터는 `reservations` 10,000건, `reservation_seats` 30,000건, `schedules` 300건을 기준으로 생성해 실행 계획을 비교했다.
+
+## 2. 예약 좌석 중복 체크 쿼리
+
+예약 생성 시 같은 상영 일정에서 이미 선택된 좌석인지 확인하기 위해 아래 조건으로 조회한다.
+
+```sql
+SELECT 1
+FROM reservation_seats rs
+JOIN reservations r
+  ON rs.reservation_id = r.reservation_id
+WHERE rs.schedule_id = 1
+  AND rs.seat_row = 'A'
+  AND rs.seat_col = 1
+  AND r.status <> 'CANCELED'
+LIMIT 1;
+```
+
+### 인덱스 적용 전
+
+![reservation seat before index](image/img_25.png)
+
+기존에는 `schedule_id`에 생성된 FK 인덱스만 사용했다.
+
+따라서 먼저 `schedule_id = 1` 조건으로 row를 찾은 뒤, `seat_row`, `seat_col` 조건은 별도의 Filter 단계에서 처리되었다.
+
+- 사용 인덱스: `schedule_id` FK 인덱스
+- 실행 방식: `schedule_id` 조회 후 좌석 행/열 조건 필터링
+- 실행 시간: 약 `3.39ms`
+
+### 인덱스 적용
+
+```sql
+CREATE INDEX idx_reservation_seats_schedule_seat
+ON reservation_seats (schedule_id, seat_row, seat_col, reservation_id);
+```
+
+### 인덱스 적용 후
+
+![reservation seat after index](image/img_26.png)
+
+복합 인덱스 적용 후에는 `schedule_id`, `seat_row`, `seat_col` 조건을 인덱스에서 한 번에 사용한다.
+
+또한 `reservation_id`까지 인덱스에 포함해 `reservations` 테이블과 조인할 때 필요한 값을 인덱스에서 바로 사용할 수 있도록 했다.
+
+- 사용 인덱스: `idx_reservation_seats_schedule_seat`
+- 실행 방식: `schedule_id + seat_row + seat_col` 기반 Covering Index Lookup
+- 실행 시간: 약 `0.0928ms`
+
+예약 좌석 중복 체크 쿼리는 약 `3.39ms`에서 `0.0928ms`로 감소했다.
+
+## 3. 만료 예약 조회 쿼리
+
+결제 대기 상태인 예약 중 일정 시간이 지난 예약을 찾기 위해 스케줄러에서 아래 조건으로 조회한다.
+
+```sql
+SELECT *
+FROM reservations
+WHERE status = 'PENDING'
+  AND reserved_at < NOW() - INTERVAL 10 MINUTE;
+```
+
+### 인덱스 적용 전
+
+![expired reservation before index](image/img_27.png)
+
+![expired reservation before index detail](image/img_28.png)
+
+기존에는 조건에 맞는 예약을 찾기 위해 `reservations` 테이블 전체를 스캔했다.
+
+- 실행 방식: Table Scan
+- 스캔 row 수: 10,000건
+- 실행 시간: 약 `4.29ms`
+
+### 인덱스 적용
+
+```sql
+CREATE INDEX idx_reservations_status_reserved_at
+ON reservations (status, reserved_at);
+```
+
+`status = 'PENDING'`으로 먼저 대상을 좁히고, 그 안에서 `reserved_at < 특정 시간` 범위 조건을 사용할 수 있도록 복합 인덱스를 구성했다.
+
+인덱스 적용 후 실행 계획은 `Table Scan`에서 `Index Range Scan`으로 변경되었다.
+
+- 사용 인덱스: `idx_reservations_status_reserved_at`
+- 실행 방식: `status` 동등 조건 + `reserved_at` 범위 조건
+- 실행 시간: 약 `0.047ms`
+
+만료 예약 조회 쿼리는 약 `4.29ms`에서 `0.047ms`로 감소했다.
+
+## 4. 상영 시간표 조회 쿼리
+
+특정 영화와 극장에 해당하는 상영 시간표를 조회할 때 아래 조건을 사용한다.
+
+```sql
+SELECT s.*
+FROM schedules s
+JOIN screens sc
+  ON s.screen_id = sc.screen_id
+WHERE s.movie_id = 1
+  AND sc.theater_id = 1;
+```
+
+### 인덱스 적용 전
+
+![schedule before index](image/img_29.png)
+
+기존에는 `screens`에서 `theater_id` 조건으로 상영관을 찾은 뒤, `schedules`에서는 `screen_id` FK 인덱스만 사용했다.
+
+이후 `movie_id = 1` 조건은 Filter 단계에서 처리되었다.
+
+- 사용 인덱스: `screen_id` FK 인덱스
+- 실행 방식: `screen_id` 조회 후 `movie_id` 필터링
+- 실행 시간: 약 `3.03ms`
+
+### 인덱스 적용
+
+```sql
+CREATE INDEX idx_schedules_screen_movie
+ON schedules (screen_id, movie_id);
+```
+
+실제 실행 계획에서 `screens.theater_id`로 먼저 상영관을 찾고, 그 결과인 `screen_id`로 `schedules`를 조회하고 있었다.
+
+따라서 조인 순서에 맞춰 `screen_id`, `movie_id` 순서의 복합 인덱스를 추가했다.
+
+### 인덱스 적용 후
+
+![schedule after index](image/img_30.png)
+
+복합 인덱스 적용 후에는 `screen_id`와 `movie_id` 조건을 함께 사용해 필요한 상영 일정만 바로 조회한다.
+
+- 사용 인덱스: `idx_schedules_screen_movie`
+- 실행 방식: `screen_id + movie_id` 기반 Index Lookup
+- 실행 시간: 약 `0.15ms`
+
+상영 시간표 조회 쿼리는 약 `3.03ms`에서 `0.15ms`로 감소했다.
+
+## 5. 최적화 결과
+
+| 대상 쿼리 | 적용 인덱스 | 개선 전 | 개선 후 |
+| --- | --- | --- | --- |
+| 예약 좌석 중복 체크 | `reservation_seats(schedule_id, seat_row, seat_col, reservation_id)` | 약 `3.39ms` | 약 `0.0928ms` |
+| 만료 예약 조회 | `reservations(status, reserved_at)` | 약 `4.29ms` | 약 `0.047ms` |
+| 상영 시간표 조회 | `schedules(screen_id, movie_id)` | 약 `3.03ms` | 약 `0.15ms` |
+
+이번 최적화를 통해 주요 조회 쿼리의 실행 계획을 `Table Scan` 또는 단일 FK 인덱스 조회 후 필터링 방식에서, 조건에 맞는 복합 인덱스를 직접 사용하는 방식으로 개선했다.
+
+</details>
+
+<details>
+<summary> <h2> 트랜잭션 분석 및 개선 </h2> </summary>
+
+## 1. 문제 상황
+
+매점 주문 생성 로직에서는 재고 차감과 결제 요청이 함께 처리된다.
+
+기존 `OrderServicePessimistic`의 주문 생성 흐름은 하나의 트랜잭션 안에서 재고에 비관적 락을 획득하고, 재고를 차감한 뒤 외부 결제 API까지 호출하는 구조였다.
+
+```text
+트랜잭션 시작
+→ 재고 조회 및 PESSIMISTIC_WRITE 락 획득
+→ 재고 차감
+→ 외부 결제 API 호출
+→ 주문 저장
+→ 트랜잭션 커밋
+```
+
+이 구조에서는 결제 API 응답을 기다리는 동안 DB 트랜잭션이 유지되고, 재고 row에 대한 락도 오래 점유될 수 있다.
+
+따라서 결제 서버 응답 지연이 발생하면 같은 재고를 주문하려는 다른 요청들이 락 대기 상태에 놓이고, 전체 주문 처리량이 낮아질 수 있다.
+
+## 2. 개선 방향
+
+외부 API 호출은 DB 트랜잭션 밖에서 수행하도록 주문 생성 흐름을 분리했다.
+
+개선 후 흐름은 아래와 같다.
+
+```text
+1. 짧은 DB 트랜잭션
+   → 재고 비관적 락 획득
+   → 재고 차감
+   → PENDING 주문 생성
+   → 커밋
+
+2. 트랜잭션 밖
+   → 외부 결제 API 호출
+
+3. 짧은 DB 트랜잭션
+   → 결제 성공 시 주문 상태를 PAID로 변경
+   → 결제 실패 시 주문 상태를 CANCELED로 변경하고 재고 복구
+```
+
+## 3. 적용 내용
+
+주문 Entity에는 결제 진행 상태를 명확히 표현하기 위해 `PENDING` 주문 생성과 상태 전이 메서드를 추가했다.
+
+```java
+public static Order createPending(User user, Store store, String paymentId, int totalPrice)
+public void completePayment()
+public void cancelPending()
+```
+
+`OrderServicePessimistic`에서는 `TransactionTemplate`을 사용해 트랜잭션 경계를 명시적으로 분리했다.
+
+```java
+PendingOrder pendingOrder = transactionTemplate.execute(status ->
+        createPendingOrder(userId, storeId, request)
+);
+
+paymentService.pay(pendingOrder.paymentId(), pendingOrder.orderName(), pendingOrder.totalPrice());
+
+return transactionTemplate.execute(status ->
+        completePayment(pendingOrder.orderId())
+);
+```
+
+결제 실패 시에는 별도의 짧은 트랜잭션에서 재고를 다시 증가시키고 주문 상태를 `CANCELED`로 변경한다.
+
+## 4. 개선 결과
+
+이번 변경으로 외부 결제 API 응답 시간만큼 DB 트랜잭션과 재고 락이 길게 유지되는 문제를 줄였다.
+
+재고 차감과 주문 상태 변경은 각각 짧은 트랜잭션으로 처리하고, 네트워크 지연 가능성이 있는 결제 API 호출은 트랜잭션 밖에서 수행하도록 분리했다.
+
+</details>
+
+<details>
+<summary> <h2> 트랜잭션 전파 속성 조사 </h2> </summary>
+
+## 1. 트랜잭션 전파 속성이란
+
+트랜잭션 전파 속성은 이미 트랜잭션이 존재하는 상황에서 다른 `@Transactional` 메서드가 호출될 때, 기존 트랜잭션에 참여할지, 새 트랜잭션을 만들지, 트랜잭션 없이 실행할지를 결정하는 설정이다.
+
+Spring에서는 `@Transactional(propagation = Propagation.XXX)` 형태로 지정한다.
+
+## 2. 전파 속성 종류
+
+| 전파 속성 | 동작 방식 | 사용 예시 |
+| --- | --- | --- |
+| `REQUIRED` | 기존 트랜잭션이 있으면 참여하고, 없으면 새로 생성한다. 기본값이다. | 대부분의 일반적인 쓰기 로직 |
+| `REQUIRES_NEW` | 항상 새 트랜잭션을 생성한다. 기존 트랜잭션이 있으면 잠시 중단된다. | 메인 트랜잭션과 독립적으로 커밋되어야 하는 로그, 이력 저장 |
+| `SUPPORTS` | 기존 트랜잭션이 있으면 참여하고, 없으면 트랜잭션 없이 실행한다. | 트랜잭션이 필수는 아닌 조회성 로직 |
+| `MANDATORY` | 반드시 기존 트랜잭션이 있어야 한다. 없으면 예외가 발생한다. | 상위 서비스 트랜잭션 안에서만 호출되어야 하는 내부 로직 |
+| `NOT_SUPPORTED` | 기존 트랜잭션이 있으면 중단하고, 트랜잭션 없이 실행한다. | 트랜잭션에 묶을 필요가 없는 외부 API 호출, 오래 걸리는 작업 |
+| `NEVER` | 트랜잭션이 있으면 예외가 발생하고, 없을 때만 실행한다. | 트랜잭션 안에서 실행되면 안 되는 작업 |
+| `NESTED` | 기존 트랜잭션 안에서 savepoint를 만들고 중첩 트랜잭션처럼 실행한다. 기존 트랜잭션이 없으면 `REQUIRED`처럼 새로 시작한다. | 일부 작업만 롤백하고 전체 트랜잭션은 유지하고 싶을 때 |
+
+## 3. 주요 속성 비교
+
+### `REQUIRED`
+
+가장 일반적인 기본 전파 속성이다.
+
+```java
+@Transactional
+public void createOrder() {
+    ...
+}
+```
+
+상위 트랜잭션이 있으면 같은 트랜잭션에 참여하기 때문에, 내부 메서드에서 예외가 발생하면 전체 작업이 함께 롤백될 수 있다.
+
+### `REQUIRES_NEW`
+
+항상 독립적인 새 트랜잭션을 만든다.
+
+```java
+@Transactional(propagation = Propagation.REQUIRES_NEW)
+public void saveAuditLog() {
+    ...
+}
+```
+
+기존 트랜잭션과 커밋/롤백 범위가 분리된다. 예를 들어 주문 생성은 실패하더라도 감사 로그는 남겨야 하는 경우 사용할 수 있다.
+
+단, 새 트랜잭션을 만들기 위해 별도 DB connection이 필요할 수 있으므로 남용하면 connection pool 부담이 커질 수 있다.
+
+### `NOT_SUPPORTED`
+
+트랜잭션을 잠시 중단하고 트랜잭션 없이 실행한다.
+
+```java
+@Transactional(propagation = Propagation.NOT_SUPPORTED)
+public void callExternalApi() {
+    ...
+}
+```
+
+외부 API 호출처럼 DB 트랜잭션에 묶을 필요가 없고 오래 걸릴 수 있는 작업에 사용할 수 있다.
+
+이번 주문 트랜잭션 개선에서는 `TransactionTemplate`으로 트랜잭션 경계를 직접 나누어 결제 API 호출을 트랜잭션 밖으로 분리했다. 같은 문제를 선언형 트랜잭션으로 풀 때는 `NOT_SUPPORTED`도 고려할 수 있다.
+
+### `NESTED`
+
+기존 트랜잭션 안에서 savepoint를 만들어 일부 작업만 롤백할 수 있게 한다.
+
+```java
+@Transactional(propagation = Propagation.NESTED)
+public void applyOptionalBenefit() {
+    ...
+}
+```
+
+전체 주문 트랜잭션은 유지하되, 부가 혜택 적용 실패만 되돌리는 식의 흐름에서 사용할 수 있다.
+
+다만 실제 동작은 사용하는 트랜잭션 매니저와 DB의 savepoint 지원 여부에 영향을 받는다.
+
+## 4. 프로젝트 적용 관점
+
+현재 프로젝트에서는 대부분의 쓰기 로직에 기본값인 `REQUIRED`가 적합하다.
+
+예약의 Named Lock 구조에서는 외부 서비스가 락을 잡고, 내부 서비스가 DB 트랜잭션을 수행한다. 이때 내부 메서드에 `REQUIRES_NEW`를 사용하면 락 획득 흐름과 DB 작업 트랜잭션을 분리해서 표현할 수 있다.
+
+매점 주문 결제처럼 외부 API 호출이 포함된 흐름에서는 하나의 긴 트랜잭션으로 묶기보다, 트랜잭션을 짧게 나누거나 외부 API 구간을 트랜잭션 밖으로 빼는 것이 적절하다.
+
+참고 자료: [Spring Framework `Propagation` 공식 문서](https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/transaction/annotation/Propagation.html)
+
+</details>
+
+<details>
+<summary> <h2> 인덱스 종류와 특징 조사 </h2> </summary>
+
+## 1. 인덱스란
+
+인덱스는 테이블의 row를 더 빠르게 찾기 위한 자료구조다.
+
+인덱스가 없으면 조건에 맞는 데이터를 찾기 위해 테이블 전체를 훑는 `Table Scan`이 발생할 수 있다. 반대로 적절한 인덱스가 있으면 `Index Lookup`, `Index Range Scan`처럼 필요한 범위만 빠르게 탐색할 수 있다.
+
+다만 인덱스는 조회 성능을 높이는 대신, insert/update/delete 시 인덱스도 함께 갱신해야 하므로 쓰기 비용과 저장 공간이 증가한다.
+
+## 2. 대표적인 인덱스 종류
+
+| 인덱스 종류 | 특징 | 사용 예시 |
+| --- | --- | --- |
+| Primary Key Index | 기본키에 생성되는 인덱스다. row를 고유하게 식별한다. | `users.user_id`, `orders.order_id` |
+| Unique Index | 중복 값을 허용하지 않는 인덱스다. 조회 성능과 중복 방지를 함께 제공한다. | `users.email`, `orders.payment_id` |
+| Single Column Index | 하나의 컬럼으로 구성된 인덱스다. | `reservations.status` |
+| Composite Index | 여러 컬럼을 묶은 인덱스다. 컬럼 순서가 중요하다. | `(status, reserved_at)`, `(screen_id, movie_id)` |
+| Covering Index | 쿼리에 필요한 컬럼을 모두 포함해 테이블 본문 조회를 줄일 수 있는 인덱스다. | `(schedule_id, seat_row, seat_col, reservation_id)` |
+| B-Tree Index | MySQL InnoDB에서 일반적으로 사용하는 인덱스 구조다. 동등 조건과 범위 조건에 모두 활용된다. | `=`, `<`, `>`, `BETWEEN`, `ORDER BY` |
+| Hash Index | 값을 해시로 찾는 방식이다. 동등 비교에 강하지만 범위 조회에는 적합하지 않다. MySQL에서는 주로 MEMORY 엔진에서 사용된다. | `key = ?` |
+| Full-Text Index | 긴 문자열에서 단어 기반 검색을 빠르게 수행하기 위한 인덱스다. | 영화 리뷰 내용 검색 |
+| Spatial Index | 위치, 좌표 같은 공간 데이터를 검색하기 위한 인덱스다. | 주변 영화관 검색 |
+
+## 3. 복합 인덱스
+
+복합 인덱스는 여러 컬럼을 하나의 인덱스로 묶는 방식이다.
+
+```sql
+CREATE INDEX idx_reservations_status_reserved_at
+ON reservations (status, reserved_at);
+```
+
+이 인덱스는 아래 쿼리에 적합하다.
+
+```sql
+SELECT *
+FROM reservations
+WHERE status = 'PENDING'
+  AND reserved_at < NOW() - INTERVAL 10 MINUTE;
+```
+
+`status`로 먼저 대상을 좁힌 뒤, `reserved_at` 범위 조건으로 만료 예약을 찾을 수 있기 때문이다.
+
+복합 인덱스에서는 컬럼 순서가 중요하다. 일반적으로 동등 조건으로 자주 쓰이는 컬럼을 앞에 두고, 범위 조건 컬럼을 뒤에 둔다.
+
+## 4. 커버링 인덱스
+
+커버링 인덱스는 쿼리 실행에 필요한 컬럼이 모두 인덱스 안에 포함된 경우를 말한다.
+
+이번 좌석 중복 체크 쿼리에서는 아래 인덱스를 사용했다.
+
+```sql
+CREATE INDEX idx_reservation_seats_schedule_seat
+ON reservation_seats (schedule_id, seat_row, seat_col, reservation_id);
+```
+
+조회 조건에 필요한 `schedule_id`, `seat_row`, `seat_col`뿐 아니라, `reservations`와 조인할 때 필요한 `reservation_id`도 포함했다.
+
+그 결과 실행 계획에서 `Covering index lookup`이 나타났고, `reservation_seats` 테이블 본문을 추가로 조회하는 비용을 줄일 수 있었다.
+
+## 5. B-Tree 인덱스
+
+MySQL InnoDB의 일반적인 인덱스는 B-Tree 기반이다.
+
+B-Tree 인덱스는 정렬된 구조를 유지하기 때문에 아래 조건에 잘 맞는다.
+
+- 동등 조건: `movie_id = 1`
+- 범위 조건: `reserved_at < ?`
+- 정렬: `ORDER BY start_at`
+- 접두 검색: `name LIKE 'CGV%'`
+
+반면 컬럼을 함수로 감싸거나 앞쪽 와일드카드를 사용하는 조건은 인덱스를 제대로 활용하기 어렵다.
+
+```sql
+-- 인덱스 활용이 어려울 수 있음
+WHERE DATE(reserved_at) = '2026-05-23'
+
+-- 앞쪽 와일드카드라 일반 B-Tree 인덱스 활용이 어려움
+WHERE name LIKE '%강남'
+```
+
+## 6. 인덱스 설계 시 주의점
+
+인덱스는 많다고 무조건 좋은 것이 아니다.
+
+조회가 빨라지는 대신 쓰기 작업에서 인덱스 갱신 비용이 추가되고, 저장 공간도 더 사용한다.
+
+따라서 실제로 자주 실행되는 쿼리를 기준으로 `EXPLAIN ANALYZE`를 확인하고, `Table Scan`, `Using filesort`, `Using temporary`, 과도한 row scan이 발생하는 경우에 인덱스를 추가하는 것이 좋다.
+
+이번 프로젝트에서는 실제 실행 계획을 확인한 뒤 아래 인덱스를 추가했다.
+
+| 대상 쿼리 | 인덱스 | 목적 |
+| --- | --- | --- |
+| 예약 좌석 중복 체크 | `(schedule_id, seat_row, seat_col, reservation_id)` | 좌석 조건을 한 번에 찾고 조인 컬럼까지 인덱스에서 사용 |
+| 만료 예약 조회 | `(status, reserved_at)` | 상태 조건과 예약 시간 범위 조건 최적화 |
+| 상영 시간표 조회 | `(screen_id, movie_id)` | 상영관 기준 조회 후 영화 조건 필터링 제거 |
+
+참고 자료: [MySQL 8.4 공식 문서 - How MySQL Uses Indexes](https://dev.mysql.com/doc/refman/8.4/en/mysql-indexes.html), [MySQL 8.4 공식 문서 - CREATE INDEX](https://dev.mysql.com/doc/mysql/en/create-index.html)
+
+</details>
